@@ -9,9 +9,49 @@ import math
 from torch.optim.lr_scheduler import LambdaLR
 from tqdm import tqdm
 import torch.nn.functional as F
+from PIL import Image
 
+class MixLoader():
+    def __init__(self, iteraters, probs = None):
+        '''
 
-def smoothing_cross_entropy(x, y):
+        :param iteraters: list of dataloader
+        '''
+        self.loaders = iteraters
+        self.iteraters = [iter(loader) for loader in iteraters]
+        self.index = [i for i, _ in enumerate(iteraters)]
+        lens = [len(i) for i in self.iteraters]
+        if probs is not None:
+            self.probs = probs
+        else:
+            self.probs = self.compute_prob(lens)
+        self.max_time = sum(lens)
+        self.iteration_times = 0
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.iteration_times >= self.max_time:
+            self.iteration_times = 0
+            raise StopIteration
+        else:
+            choice = np.random.choice(self.index, p=self.probs)
+            try:
+                data = next(self.iteraters[choice])
+                self.iteration_times += 1
+                return data
+            except:
+                self.iteraters[choice] = iter(self.loaders[choice])
+                return self.__next__()
+
+    @staticmethod
+    def compute_prob(x):
+        total = sum(x)
+        result = [i/total for i in x]
+        return result
+
+def smoothing_cross_entropy(x, y,):
     '''
     -y log pre
     :param x: N, D
@@ -36,15 +76,16 @@ class Model(nn.Module):
         return x
 
     def load_model(self):
-        start_state = torch.load('model.ckpt', map_location=self.device)
+        start_state = torch.load('model.pth', map_location=self.device)
         self.model.load_state_dict(start_state['model_state'])
+        # self.load_state_dict(start_state)
         print('using loaded model')
         print('-' * 100)
 
     def save_model(self):
-        result = {}
-        result['model_state'] = self.model.state_dict()
-        torch.save(result, 'model.ckpt')
+        #result = self.model.state_dict()
+        result = self.model.state_dict()
+        torch.save(result, 'model.pth')
 
 
 def get_cosine_schedule_with_warmup(
@@ -66,34 +107,44 @@ def get_cosine_schedule_with_warmup(
 
 class NoisyStudent():
     def __init__(self,
-                 batch_size=32,
-                 lr=4e-3,
-                 weight_decay=0.05, ):
+                 batch_size=64,
+                 lr=1e-4,
+                 weight_decay=0,
+                 train_image_path='./public_dg_0416/train/',
+                 valid_image_path='./public_dg_0416/train/',
+                 label2id_path='./dg_label_id_mapping.json',
+                 test_image_path='./public_dg_0416/public_test_flat/'
+                 ):
         self.result = {}
         from data.data import get_loader, get_test_loader
         self.train_loader = get_loader(batch_size=batch_size,
                                        valid_category=None,
-                                       train_image_path='./public_dg_0416/train/',
-                                       valid_image_path='./public_dg_0416/train/',
-                                       label2id_path='./dg_label_id_mapping.json')
+                                       train_image_path=train_image_path,
+                                       valid_image_path=valid_image_path,
+                                       label2id_path=label2id_path)
         self.test_loader_predict, _ = get_test_loader(batch_size=batch_size,
                                                       transforms=None,
-                                                      label2id_path='./dg_label_id_mapping.json')
+                                                      label2id_path=label2id_path,
+                                                      test_image_path=test_image_path)
         self.test_loader_student, self.label2id = get_test_loader(batch_size=batch_size,
                                                                   transforms='train',
-                                                                  label2id_path='./dg_label_id_mapping.json')
+                                                                  label2id_path=label2id_path,
+                                                                  test_image_path=test_image_path)
 
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.model = Model().to(self.device)
-        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr, weight_decay=weight_decay)
-        if os.path.exists('model.ckpt'):
+
+        if os.path.exists('model.pth'):
             self.model.load_model()
+
+        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr, weight_decay=weight_decay)
 
     def save_result(self):
         from data.data import write_result
         result = {}
         for name, pre in list(self.result.items()):
-            _, result[name] = torch.max(pre, dim = 1).item()
+            _, y = torch.max(pre, dim = 1)
+            result[name] = y.item()
 
         write_result(result)
 
@@ -134,7 +185,42 @@ class NoisyStudent():
         for epoch in range(1, total_epoch + 1):
             # first, predict
             self.model.eval()
-            # self.predict()
+            self.predict()
+            self.save_result()
+
+
+            self.model.train()
+            train_loss = 0
+            train_acc = 0
+            step = 0
+            pbar = tqdm(self.test_loader_student)
+            for x, y in pbar:
+                x = x.to(self.device)
+                y = self.get_label(y)
+                x = self.model(x)  # N, 60
+                _, pre = torch.max(x, dim=1)
+                loss = criterion(x, y)
+                _, y = torch.max(y, dim = 1)
+                train_acc += (torch.sum(pre == y).item()) / y.shape[0]
+                train_loss += loss.item()
+                self.optimizer.zero_grad()
+                loss.backward()
+
+                nn.utils.clip_grad_value_(self.model.parameters(), 0.1)
+                self.optimizer.step()
+                step += 1
+                # scheduler.step()
+                if step % 10 == 0:
+                    pbar.set_postfix_str(f'loss = {train_loss / step}, acc = {train_acc / step}')
+
+            train_loss /= len(self.test_loader_student)
+            train_acc /= len(self.test_loader_student)
+
+            print(f'epoch {epoch}, test loader loss = {train_loss}, acc = {train_acc}')
+
+            ################################################################################################
+
+
 
             # train
             self.model.train()
@@ -148,12 +234,11 @@ class NoisyStudent():
                 y = y.to(self.device)
                 x = self.model(x)  # N, 60
                 _, pre = torch.max(x, dim=1)
-                train_acc += (torch.sum(pre == y).item()) / y.shape[0]
                 loss = criterion(x, y)
+                train_acc += (torch.sum(pre == y).item()) / y.shape[0]
                 train_loss += loss.item()
                 self.optimizer.zero_grad()
                 loss.backward()
-
                 nn.utils.clip_grad_value_(self.model.parameters(), 0.1)
                 self.optimizer.step()
                 step += 1
@@ -168,37 +253,29 @@ class NoisyStudent():
 
             #############################################################################################
 
-            self.model.train()
-            train_loss = 0
-            train_acc = 0
-            step = 0
-            pbar = tqdm(self.test_loader_student)
-            for x, y in pbar:
-                x = x.to(self.device)
-                y = self.get_label(y)
-                x = self.model(x)  # N, 60
-                _, pre = torch.max(x, dim=1)
-                train_acc += (torch.sum(pre == y).item()) / y.shape[0]
-                loss = criterion(x, y)
-                train_loss += loss.item()
-                self.optimizer.zero_grad()
-                loss.backward()
 
-                nn.utils.clip_grad_value_(self.model.parameters(), 0.1)
-                self.optimizer.step()
-                step += 1
-                # scheduler.step()
-                if step % 10 == 0:
-                    pbar.set_postfix_str(f'loss = {train_loss / step}, acc = {train_acc / step}')
-
-            train_loss /= len(self.train_loader)
-            train_acc /= len(self.train_loader)
-
-            print(f'epoch {epoch}, test loader loss = {train_loss}, acc = {train_acc}')
 
             self.model.save_model()
 
 
+
+
+
+
 if __name__ == '__main__':
-    x = NoisyStudent()
-    x.train(total_epoch=1)
+    x = NoisyStudent(batch_size = 1)
+    x.train(total_epoch=10)
+
+
+
+    # train_image_path = './public_dg_0416/train/'
+    # valid_image_path = './public_dg_0416/train/'
+    # label2id_path = './dg_label_id_mapping.json'
+    # test_image_path = './public_dg_0416/public_test_flat/'
+    # from data.data import get_loader
+    # train_loader = get_loader(batch_size=10,
+    #                                valid_category=None,
+    #                                train_image_path=train_image_path,
+    #                                valid_image_path=valid_image_path,
+    #                                label2id_path=label2id_path)
+    # train(train_loader)
