@@ -11,8 +11,9 @@ from tqdm import tqdm
 import torch.nn.functional as F
 from PIL import Image
 
+
 class MixLoader():
-    def __init__(self, iteraters, probs = None):
+    def __init__(self, iteraters, probs=None):
         '''
 
         :param iteraters: list of dataloader
@@ -48,10 +49,14 @@ class MixLoader():
     @staticmethod
     def compute_prob(x):
         total = sum(x)
-        result = [i/total for i in x]
+        result = [i / total for i in x]
         return result
 
-def smoothing_cross_entropy(x, y,):
+    def __len__(self):
+        return self.max_time
+
+
+def smoothing_cross_entropy(x, y, ):
     '''
     -y log pre
     :param x: N, D
@@ -60,7 +65,7 @@ def smoothing_cross_entropy(x, y,):
     '''
     if x.shape != y.shape:
         return F.cross_entropy(x, y)
-    return F.kl_div(F.log_softmax(x, dim=1), y)
+    return F.kl_div(F.log_softmax(x, dim=1), y, reduction='batchmean')
 
 
 class Model(nn.Module):
@@ -69,7 +74,7 @@ class Model(nn.Module):
         self.model = models.resnet50(num_classes=60, )
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         # self.apply(self._init_weights)
-        print('resnet' * 100)
+        print('mix' * 100)
 
     def forward(self, x):
         x = self.model(x)
@@ -83,7 +88,7 @@ class Model(nn.Module):
         print('-' * 100)
 
     def save_model(self):
-        #result = self.model.state_dict()
+        # result = self.model.state_dict()
         result = self.model.state_dict()
         torch.save(result, 'model.pth')
 
@@ -130,7 +135,9 @@ class NoisyStudent():
                                                                   transforms='train',
                                                                   label2id_path=label2id_path,
                                                                   test_image_path=test_image_path)
-
+        self.train_loader = MixLoader([self.train_loader, self.test_loader_student],
+                                      probs=[0.5, 0.5])
+        del self.test_loader_student
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.model = Model().to(self.device)
 
@@ -139,15 +146,19 @@ class NoisyStudent():
 
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr, weight_decay=weight_decay)
 
-    def save_result(self):
+    def save_result(self, epoch=None):
         from data.data import write_result
         result = {}
         for name, pre in list(self.result.items()):
-            _, y = torch.max(pre, dim = 1)
+            _, y = torch.max(pre, dim=1)
             result[name] = y.item()
 
-        write_result(result)
+        if epoch is not None:
+            write_result(result, path='prediction' + str(epoch) + '.json')
+        else:
+            write_result(result)
 
+        return result
 
     def predict(self):
         with torch.no_grad():
@@ -186,59 +197,28 @@ class NoisyStudent():
             # first, predict
             self.model.eval()
             self.predict()
-            self.save_result()
+            self.save_result(epoch)
 
-
-            self.model.train()
-            train_loss = 0
-            train_acc = 0
-            step = 0
-            pbar = tqdm(self.test_loader_student)
-            for x, y in pbar:
-                x = x.to(self.device)
-                y = self.get_label(y)
-                x = self.model(x)  # N, 60
-                _, pre = torch.max(x, dim=1)
-                loss = criterion(x, y)
-                _, y = torch.max(y, dim = 1)
-                train_acc += (torch.sum(pre == y).item()) / y.shape[0]
-                train_loss += loss.item()
-                self.optimizer.zero_grad()
-                loss.backward()
-
-                nn.utils.clip_grad_value_(self.model.parameters(), 0.1)
-                self.optimizer.step()
-                step += 1
-                # scheduler.step()
-                if step % 10 == 0:
-                    pbar.set_postfix_str(f'loss = {train_loss / step}, acc = {train_acc / step}')
-
-            train_loss /= len(self.test_loader_student)
-            train_acc /= len(self.test_loader_student)
-
-            print(f'epoch {epoch}, test loader loss = {train_loss}, acc = {train_acc}')
-
-            ################################################################################################
-
-
-
-            # train
             self.model.train()
             train_loss = 0
             train_acc = 0
             step = 0
             pbar = tqdm(self.train_loader)
-
             for x, y in pbar:
                 x = x.to(self.device)
+                if isinstance(y, tuple):
+                    y = self.get_label(y)
                 y = y.to(self.device)
                 x = self.model(x)  # N, 60
                 _, pre = torch.max(x, dim=1)
                 loss = criterion(x, y)
+                if pre.shape != y.shape:
+                    _, y = torch.max(y, dim=1)
                 train_acc += (torch.sum(pre == y).item()) / y.shape[0]
                 train_loss += loss.item()
                 self.optimizer.zero_grad()
                 loss.backward()
+
                 nn.utils.clip_grad_value_(self.model.parameters(), 0.1)
                 self.optimizer.step()
                 step += 1
@@ -249,24 +229,14 @@ class NoisyStudent():
             train_loss /= len(self.train_loader)
             train_acc /= len(self.train_loader)
 
-            print(f'epoch {epoch}, train loader loss = {train_loss}, acc = {train_acc}')
-
-            #############################################################################################
-
-
+            print(f'epoch {epoch}, test loader loss = {train_loss}, acc = {train_acc}')
 
             self.model.save_model()
 
 
-
-
-
-
 if __name__ == '__main__':
-    x = NoisyStudent(batch_size = 1)
+    x = NoisyStudent(batch_size=1)
     x.train(total_epoch=10)
-
-
 
     # train_image_path = './public_dg_0416/train/'
     # valid_image_path = './public_dg_0416/train/'
